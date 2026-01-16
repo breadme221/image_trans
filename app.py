@@ -108,21 +108,17 @@ def toggle_langs():
     for lang in LANG_CODE_MAP.keys():
         st.session_state[f"lang_{lang}"] = st.session_state.select_all_key
 
-def translate_single_image(img_bytes, lang, file_name, gen_model, user_prompt):
+def translate_single_image(orig_image, lang, file_name, gen_model, user_prompt):
     """단일 이미지 번역 함수"""
     try:
-        # 이미지 준비 (바이트에서 읽기)
-        orig = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-        orig.format = file_name.split('.')[-1].upper()
-
         t_start = time.time()
 
         # 1. Gemini 번역
         p_gen = f"{get_glossary_prompt(lang)}\nTranslate all text to {lang}. {user_prompt}\nOutput result as image. Preserve layout."
-        resp = gen_model.generate_content([p_gen, orig])
+        resp = gen_model.generate_content([p_gen, orig_image])
 
         if resp.candidates and resp.candidates[0].content.parts[0].inline_data:
-            data = restore_transparency(orig, resp.candidates[0].content.parts[0].inline_data.data)
+            data = restore_transparency(orig_image, resp.candidates[0].content.parts[0].inline_data.data)
 
             # 2. 자동 검수
             audit = run_auto_audit(data, lang)
@@ -196,15 +192,16 @@ else:
         for f in uploaded_files:
             st.info(f"🖼️ **{f.name}** 처리 중...")
 
-            # 파일 바이트 미리 읽기 (스레드 안전)
+            # 원본 이미지 미리 로드 (스레드 안전 - 읽기 전용)
             f.seek(0)
-            img_bytes = f.read()
+            orig_image = Image.open(f).convert("RGBA")
+            orig_image.format = f.name.split('.')[-1].upper()
 
             # ThreadPoolExecutor로 14개 언어 동시 처리
             with ThreadPoolExecutor(max_workers=14) as executor:
                 # 모든 언어에 대한 Future 생성
                 futures = {
-                    executor.submit(translate_single_image, img_bytes, lang, f.name, gen_model, user_prompt): lang
+                    executor.submit(translate_single_image, orig_image, lang, f.name, gen_model, user_prompt): lang
                     for lang in selected_langs
                 }
 
