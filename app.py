@@ -6,6 +6,8 @@ import zipfile
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # --- 1. 설정 및 API 키 ---
 if "GOOGLE_API_KEY" in st.secrets:
@@ -106,6 +108,51 @@ def toggle_langs():
     for lang in LANG_CODE_MAP.keys():
         st.session_state[f"lang_{lang}"] = st.session_state.select_all_key
 
+def translate_single_image(f, lang, file_name, gen_model, user_prompt):
+    """단일 이미지 번역 함수"""
+    try:
+        # 이미지 준비
+        f.seek(0)
+        orig = Image.open(f).convert("RGBA")
+        orig.format = file_name.split('.')[-1].upper()
+
+        t_start = time.time()
+
+        # 1. Gemini 번역
+        p_gen = f"{get_glossary_prompt(lang)}\nTranslate all text to {lang}. {user_prompt}\nOutput result as image. Preserve layout."
+        resp = gen_model.generate_content([p_gen, orig])
+
+        if resp.candidates and resp.candidates[0].content.parts[0].inline_data:
+            data = restore_transparency(orig, resp.candidates[0].content.parts[0].inline_data.data)
+
+            # 2. 자동 검수
+            audit = run_auto_audit(data, lang)
+
+            duration = time.time() - t_start
+
+            return {
+                "lang": lang,
+                "data": data,
+                "name": file_name,
+                "audit": audit,
+                "time": duration,
+                "success": True
+            }
+        else:
+            return {
+                "lang": lang,
+                "name": file_name,
+                "error": "No response from Gemini",
+                "success": False
+            }
+    except Exception as e:
+        return {
+            "lang": lang,
+            "name": file_name,
+            "error": str(e),
+            "success": False
+        }
+
 # UI 구성
 st.set_page_config(page_title="Moneywalk 번역기 (JSON Mode)", layout="wide")
 st.title("글로벌 이미지 번역기")
@@ -141,47 +188,54 @@ else:
         progress = st.progress(0); status = st.empty()
         
         total = len(uploaded_files) * len(selected_langs)
-        done = 0; start_all = time.time()
+        done = [0]  # 리스트로 감싸서 mutable하게
+        start_all = time.time()
         res_cols = st.columns(4)
+        lock = threading.Lock()  # Thread-safe 업데이트용
 
+        # 각 이미지마다 병렬 처리
         for f in uploaded_files:
-            f.seek(0); orig = Image.open(f).convert("RGBA")
-            orig.format = f.name.split('.')[-1].upper()
-            
-            for lang in selected_langs:
-                t_start = time.time(); done += 1
-                progress.progress(done / total)
-                status.markdown(f"**🔄 처리 중 ({done}/{total}):** {f.name} → {lang}")
-                
-                try:
-                    # 1. 이미지 생성 (Gemini 3 Pro)
-                    p_gen = f"{get_glossary_prompt(lang)}\nTranslate all text to {lang}. {user_prompt}\nOutput result as image. Preserve layout."
-                    resp = gen_model.generate_content([p_gen, orig])
-                    
-                    if resp.candidates and resp.candidates[0].content.parts[0].inline_data:
-                        data = restore_transparency(orig, resp.candidates[0].content.parts[0].inline_data.data)
-                        
-                        # 2. [강제 정독] 자동 검수 (JSON Mode)
-                        audit = run_auto_audit(data, lang)
-                        
-                        duration = time.time() - t_start
-                        res_obj = {"lang": lang, "data": data, "name": f.name, "audit": audit, "time": duration}
-                        st.session_state.results.append(res_obj)
+            st.info(f"🖼️ **{f.name}** 처리 중...")
 
-                        # 3. 실시간 출력
-                        with res_cols[(done-1) % 4]:
-                            st.markdown(f"**{lang}** ({duration:.1f}초)")
-                            st.image(data, use_container_width=True)
-                            
-                            if audit:
-                                st.info(f"**이미지에 이렇게 쓰여있어요**\n\n{audit.get('meaning_kr', '-')}")
-                                errs = audit.get('critical_errors', [])
+            # ThreadPoolExecutor로 14개 언어 동시 처리
+            with ThreadPoolExecutor(max_workers=14) as executor:
+                # 모든 언어에 대한 Future 생성
+                futures = {
+                    executor.submit(translate_single_image, f, lang, f.name, gen_model, user_prompt): lang
+                    for lang in selected_langs
+                }
+
+                # 완료되는 순서대로 처리
+                for future in as_completed(futures):
+                    result = future.result()
+
+                    # Progress 업데이트 (thread-safe)
+                    with lock:
+                        done[0] += 1
+                        progress.progress(done[0] / total)
+                        status.markdown(f"**✅ 완료 ({done[0]}/{total}):** {result['name']} → {result['lang']}")
+
+                    if result['success']:
+                        st.session_state.results.append(result)
+
+                        # 결과 표시
+                        col_idx = (done[0] - 1) % 4
+                        with res_cols[col_idx]:
+                            st.markdown(f"**{result['lang']}** ({result['time']:.1f}초)")
+                            st.image(result['data'], use_container_width=True)
+
+                            if result['audit']:
+                                st.info(f"**의미**: {result['audit'].get('meaning_kr', '-')}")
+                                errs = result['audit'].get('critical_errors', [])
                                 if errs:
-                                    st.error(f"**오타 발견**\n" + "\n".join([f"- {e}" for e in errs]))
+                                    st.error(f"**오타**: " + "\n".join([f"- {e}" for e in errs]))
                             st.divider()
-                        
-                        if done % 4 == 0: res_cols = st.columns(4)
-                except Exception as e: st.error(f"에러: {e}")
+
+                        # 4개마다 새 컬럼
+                        if done[0] % 4 == 0:
+                            res_cols = st.columns(4)
+                    else:
+                        st.error(f"에러 ({result['lang']}): {result.get('error', 'Unknown error')}")
         
         st.success(f"✅ 전체 완료! (총 {time.time()-start_all:.1f}초)")
         progress.empty()
