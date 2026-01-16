@@ -108,12 +108,11 @@ def toggle_langs():
     for lang in LANG_CODE_MAP.keys():
         st.session_state[f"lang_{lang}"] = st.session_state.select_all_key
 
-def translate_single_image(f, lang, file_name, gen_model, user_prompt):
+def translate_single_image(img_bytes, lang, file_name, gen_model, user_prompt):
     """단일 이미지 번역 함수"""
     try:
-        # 이미지 준비
-        f.seek(0)
-        orig = Image.open(f).convert("RGBA")
+        # 이미지 준비 (바이트에서 읽기)
+        orig = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
         orig.format = file_name.split('.')[-1].upper()
 
         t_start = time.time()
@@ -197,11 +196,15 @@ else:
         for f in uploaded_files:
             st.info(f"🖼️ **{f.name}** 처리 중...")
 
+            # 파일 바이트 미리 읽기 (스레드 안전)
+            f.seek(0)
+            img_bytes = f.read()
+
             # ThreadPoolExecutor로 14개 언어 동시 처리
             with ThreadPoolExecutor(max_workers=14) as executor:
                 # 모든 언어에 대한 Future 생성
                 futures = {
-                    executor.submit(translate_single_image, f, lang, f.name, gen_model, user_prompt): lang
+                    executor.submit(translate_single_image, img_bytes, lang, f.name, gen_model, user_prompt): lang
                     for lang in selected_langs
                 }
 
